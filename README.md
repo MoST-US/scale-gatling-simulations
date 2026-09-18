@@ -428,3 +428,13 @@ capacity while users are independently active only part of the time.
 The repository includes a local Maven repository under `local-repo`. Do not use
 `dependency-reduced-pom.xml` as the project build file; use `pom.xml`. The
 `-o` option prevents Maven from contacting Maven Central.
+
+Only `local-repo` is used by the build. The sibling directory
+`local-repo -DskipTests` is an accidental duplicate of that repository (1,146 files
+committed by a mis-quoted Maven invocation): nothing references it, and it is slated for
+removal. To drop it from the repository:
+
+```bash
+git rm -r --cached "local-repo -DskipTests"
+rm -rf "local-repo -DskipTests"
+```

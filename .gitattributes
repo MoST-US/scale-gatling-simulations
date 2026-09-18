@@ -1,0 +1,13 @@
+# Normalize text files on commit; keep cluster-facing scripts LF.
+* text=auto
+
+# The repository is developed on Windows and executed on Linux/SLURM/WSL:
+# a CRLF .sh/.sbatch fails on the cluster with "bad interpreter: \r".
+*.sh     text eol=lf
+*.sbatch text eol=lf
+*.py     text eol=lf
+mvnw     text eol=lf
+mvnw.cmd text eol=crlf
+
+# Binaries / generated artifacts
+*.jar binary
