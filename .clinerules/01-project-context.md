@@ -16,6 +16,10 @@ population of simulated subscribers and measures how the service behaves under l
 - Time envelope: users arrive evenly during `USER_RAMP_MINUTES`, then measurement runs
   for `SIMULATION_MINUTES`. With the default `INTERACT_DURING_RAMP=false`, everyone waits
   at a rendezvous barrier until the ramp completes.
+- Output: one report folder per execution,
+  `target/gatling/<name>-<yyyyMMddHHmmssSSS>/`, holding the Gatling HTML report plus
+  `used_config.txt`, the effective configuration of that run. Direct runs take `name`
+  from `EXPERIMENT_NAME`; queued runs use the queued run name.
 
 ## Sources of truth
 - `README.md` - authoritative behaviour, setup, queue and SLURM documentation.

@@ -27,6 +27,14 @@ the current one has finished, so you can enqueue several runs and walk away. An
 item that exits non-zero is moved to queue/failed/ and the worker continues with
 the next item.
 
+The queued run name is the experiment name of that execution. The worker passes
+-Dgatling.core.outputDirectoryBaseName=<name> (the property Gatling 3.10.5 uses for
+the report folder, which is the only one that works: "gatling.runId" does not
+exist), so the report lands in target/gatling/<name>-<yyyyMMddHHmmssSSS>/ and that
+folder receives a used_config.txt holding the effective configuration of the run
+(the base .env merged with the item's overrides). run-llm-workload.sh does the same
+with its EXPERIMENT_NAME.
+
 Directory layout (all created on demand):
     queue/pending/<name>.env    enqueued, waiting
     queue/running/<name>.env    claimed and currently executing
@@ -34,6 +42,8 @@ Directory layout (all created on demand):
     queue/failed/<name>.env     finished with an error
     results/runs.jsonl          append-only per-run audit log
     logs/<runId>.log            Gatling console output
+    target/gatling/<name>-<timestamp>/                  Gatling report folder of that run
+    target/gatling/<name>-<timestamp>/used_config.txt   effective configuration of that run
 
 Usage:
     python run_queue.py add <name> [--set KEY=VALUE ...] [--env-file PATH]
@@ -57,7 +67,9 @@ Environment / command building mirrors run-llm-workload.sh:
 
 Test hook: set the environment variable RUN_QUEUE_CMD to an alternate launcher
 (e.g. "python -c ...") to substitute the Maven invocation; it is called once per
-run, which makes it easy to verify queue state transitions without a live LLM.
+run, which makes it easy to verify queue state transitions without a live LLM. A
+fake launcher that creates target/gatling/<name>-<timestamp>/ also exercises the
+report-folder discovery and used_config.txt writing.
 The value is split with shlex, so on Windows use forward slashes in file paths
 (shlex treats backslashes as escape characters).
 """
@@ -84,6 +96,9 @@ FAILED_DIR = os.path.join(QUEUE_DIR, "failed")
 RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 RUNS_LOG = os.path.join(RESULTS_DIR, "runs.jsonl")
 LOGS_DIR = os.path.join(ROOT_DIR, "logs")
+
+# Gatling writes one report folder per run (<name>-<yyyyMMddHHmmssSSS>) here.
+GATLING_REPORTS_DIR = os.path.join(ROOT_DIR, "target", "gatling")
 
 LOCAL_REPO = os.path.join(ROOT_DIR, "local-repo")
 
@@ -198,7 +213,7 @@ def log_event(record: dict) -> None:
 # --------------------------------------------------------------------------- #
 # Command construction & invocation
 # --------------------------------------------------------------------------- #
-def build_command(run_id: str, merged: dict):
+def build_command(report_base: str, merged: dict):
     if os.path.isdir(LOCAL_REPO):
         offline = ["-o", "-Dmaven.repo.local=" + LOCAL_REPO]
     else:
@@ -216,12 +231,63 @@ def build_command(run_id: str, merged: dict):
     args = list(base) + [
         "gatling:test",
         "-Dgatling.simulationClass=simulations.LLMWorkloadSimulation",
-        "-Dgatling.runId=" + run_id,
+        # Gatling names the report folder <base>-<yyyyMMddHHmmssSSS> under
+        # target/gatling. "gatling.runId" is not a Gatling 3.10.5 property.
+        "-Dgatling.core.outputDirectoryBaseName=" + report_base,
         "-Dgatling.core.checkVersion=false",
     ] + offline
     for k in sorted(merged):
         args.append("-D%s=%s" % (k, merged[k]))
     return args
+
+
+def newest_report_dir(report_base: str):
+    """Return the report folder Gatling just created, or None.
+
+    Gatling appends a zero-padded yyyyMMddHHmmssSSS timestamp to the configured
+    base name, so the lexicographically greatest match is the newest folder.
+    """
+    if not os.path.isdir(GATLING_REPORTS_DIR):
+        return None
+    prefix = report_base + "-"
+    matches = [
+        os.path.join(GATLING_REPORTS_DIR, entry)
+        for entry in os.listdir(GATLING_REPORTS_DIR)
+        if entry.startswith(prefix) and os.path.isdir(os.path.join(GATLING_REPORTS_DIR, entry))
+    ]
+    return max(matches) if matches else None
+
+
+def write_used_config(report_dir: str, report_base: str, run_name: str, run_id: str,
+                      merged: dict, command, overrides: dict):
+    """Write used_config.txt into the run's report folder.
+
+    The file is .env-style (a comment header plus KEY=VALUE lines), so it can be
+    fed back through --env-file. Returns the path, or None when it cannot be
+    written: recording the configuration must never fail an otherwise fine run.
+    """
+    source = os.path.relpath(BASE_ENV, ROOT_DIR).replace(os.sep, "/")
+    lines = [
+        "# used_config.txt - effective configuration of this Gatling run",
+        "# experiment : %s" % report_base,
+        "# run item   : %s" % run_name,
+        "# run id     : %s" % run_id,
+        "# report dir : %s" % os.path.relpath(report_dir, ROOT_DIR).replace(os.sep, "/"),
+        "# started    : %s" % now_iso(),
+        "# source     : %s" % source,
+        "# overrides  : %s" % (", ".join(sorted(overrides)) if overrides else "none"),
+        "# command    : %s" % shell_join(command),
+        "",
+    ]
+    lines += ["%s=%s" % (key, merged[key]) for key in sorted(merged)]
+    path = os.path.join(report_dir, "used_config.txt")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except OSError as exc:
+        print("WARNING: could not write %s (%s)" % (path, exc), file=sys.stderr)
+        return None
+    return path
 
 
 def invoke(args, log_path: str) -> int:
@@ -245,7 +311,12 @@ def _run_one(pending_path: str, dry_run: bool = False) -> bool:
     merged.update(overrides)
     rate_limits = merged.get("USER_RATE_LIMITS", DEFAULT_USER_RATE_LIMITS)
     parse_rate_limits(rate_limits)
+    # The queued run name is the experiment name: it is the prefix of the Gatling
+    # report folder (target/gatling/<name>-<timestamp>).
+    report_base = name
     run_id = run_id_for(name)
+    command = build_command(report_base, merged)
+    report_dir_hint = os.path.join("target", "gatling", report_base + "-<timestamp>")
 
     if dry_run:
         print("Run        : %s" % name)
@@ -255,32 +326,46 @@ def _run_one(pending_path: str, dry_run: bool = False) -> bool:
         for k in sorted(merged):
             print("  %s=%s" % (k, merged[k]))
         print("Command:")
-        print("  " + shell_join(build_command(run_id, merged)))
+        print("  " + shell_join(command))
         print("Log file (would be): %s" % os.path.join(LOGS_DIR, run_id + ".log"))
+        print("Report dir (would be): %s" % report_dir_hint)
+        print("Config file (would be): %s" % os.path.join(report_dir_hint, "used_config.txt"))
         return True
 
     running_path = os.path.join(RUNNING_DIR, os.path.basename(pending_path))
     ensure_dirs()
     os.replace(pending_path, running_path)  # atomic claim on the same filesystem
-    log_event({"event": "started", "run": name, "run_id": run_id,
+    log_event({"event": "started", "run": name, "run_id": run_id, "report_base": report_base,
                "status": "running", "started_at": now_iso()})
-    print("[%s] START  %s (run_id=%s)" % (now_iso(), name, run_id))
+    print("[%s] START  %s (run_id=%s, report=%s)"
+          % (now_iso(), name, run_id, report_dir_hint))
 
     log_path = os.path.join(LOGS_DIR, run_id + ".log")
-    exit_code = invoke(build_command(run_id, merged), log_path)
+    exit_code = invoke(command, log_path)
     status = "done" if exit_code == 0 else "failed"
+    report_dir = newest_report_dir(report_base)
+    config_file = None
+    if report_dir is None:
+        print("WARNING: no report folder matching %s was found; used_config.txt not written."
+              % os.path.join("target", "gatling", report_base + "-*"), file=sys.stderr)
+    else:
+        config_file = write_used_config(report_dir, report_base, name, run_id, merged,
+                                        command, overrides)
     record = {"event": "finished", "run": name, "run_id": run_id, "status": status,
               "exit_code": exit_code, "finished_at": now_iso(),
               "log_file": os.path.join("logs", run_id + ".log")}
-    if exit_code == 0:
-        record["report_dir"] = os.path.join("target", "gatling", run_id)
+    if report_dir is not None:
+        record["report_dir"] = os.path.relpath(report_dir, ROOT_DIR).replace(os.sep, "/")
+    if config_file is not None:
+        record["used_config"] = os.path.relpath(config_file, ROOT_DIR).replace(os.sep, "/")
     log_event(record)
 
     dest = os.path.join(DONE_DIR if exit_code == 0 else FAILED_DIR,
                         os.path.basename(pending_path))
     os.replace(running_path, dest)
-    print("[%s] END    %s -> %s (exit=%d, log=%s)"
-          % (now_iso(), name, status, exit_code, log_path))
+    print("[%s] END    %s -> %s (exit=%d, log=%s%s)"
+          % (now_iso(), name, status, exit_code, log_path,
+             ", report=" + record["report_dir"] if "report_dir" in record else ""))
     return exit_code == 0
 
 

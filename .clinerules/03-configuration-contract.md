@@ -26,6 +26,18 @@ non-negative integers. It is validated twice - keep both behaviours:
 - `run-llm-workload.sh::validate_rate_limits` fails fast with a clear error before Java
   starts. That pre-flight check is deliberate: a typo must not cost an hour of wall time.
 
+## EXPERIMENT_NAME (run identity)
+`EXPERIMENT_NAME` is the prefix of the Gatling report folder:
+`target/gatling/<EXPERIMENT_NAME>-<yyyyMMddHHmmssSSS>/`. It is consumed by
+`run-llm-workload.sh` (and therefore `submit_llm_workload.sbatch`); queued runs use the
+queued run name instead, so a queue item never depends on it. `SimulationConfig` does not
+read it - the simulation cannot influence Gatling's output directory - so adding it does
+not follow the four-step parameter change above. It must stay whitespace-free
+(`[A-Za-z0-9][A-Za-z0-9._-]*`): it reaches the forked JVM as a system property and the
+Maven plugin refuses to propagate properties containing whitespace. The folder name is
+produced by `gatling.core.outputDirectoryBaseName`; `gatling.runId` does not exist in
+Gatling 3.10.5 and must not be reintroduced.
+
 ## Units model
 Units refill continuously (`unitsPerMinute * elapsedMs / 60000`) and are capped at
 `UNITS_PER_REQUEST * MAX_ACCUMULATED_REQUESTS` per user. The example sets

@@ -40,6 +40,10 @@ Project-specific rules live in `.clinerules/` (read the file that matches the wo
   `run_queue.py list` and `estimate_requests.py` instead.
 - Runs must stay comparable: the seeded (`new Random(42)`) schedule generation and the
   meaning of existing `.env` keys are part of the experiment.
+- Report folders are `target/gatling/<EXPERIMENT_NAME>-<timestamp>/` for direct runs and
+  `<queued run name>-<timestamp>/` for queued ones; each holds a `used_config.txt` with
+  the configuration that run used. That name comes from
+  `-Dgatling.core.outputDirectoryBaseName` - `gatling.runId` does nothing in Gatling 3.10.5.
 - Keep LF line endings in `*.sh`, `*.sbatch` and `*.py` (developed on Windows, executed
   on Linux; `.gitattributes` pins this).
 - Never commit `queue/`, `results/`, `logs/`, `target/`, `.env`, `*.out`, `*.err`.

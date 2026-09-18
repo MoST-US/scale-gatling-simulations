@@ -18,7 +18,13 @@ paths:
     merged over `.env` and passed as `-D` JVM properties so `-D` wins;
   - state directories `queue/{pending,running,done,failed}`, append-only
     `results/runs.jsonl`, console output in `logs/<runId>.log`;
-  - unique `runId=<name>-<timestamp>` so each run gets its own report directory;
+  - the queued run name is the experiment name: its report lands in
+    `target/gatling/<name>-<yyyyMMddHHmmssSSS>/`, produced by
+    `-Dgatling.core.outputDirectoryBaseName=<name>` (`gatling.runId` does not exist in
+    Gatling 3.10.5); the resolved folder is what `results/runs.jsonl` records;
+  - after every run the worker writes `used_config.txt` (header + the effective
+    `KEY=VALUE` set, i.e. base `.env` merged with the item overrides) into that folder; a
+    missing report folder is a warning, never a failed run;
   - a failed run moves to `queue/failed/` and the worker keeps going; the process only
     exits non-zero at the end (`--once`);
   - `mvnw.cmd` on Windows vs `sh ./mvnw` on POSIX, offline mode when `local-repo/`
@@ -41,6 +47,8 @@ paths:
   `./submit_run_queue.sh c07`) - never hardcode a new node inside the logic.
 - Keep the `.env` presence checks and the `USER_RATE_LIMITS` pre-flight validation in
   `run-llm-workload.sh`: they exist so a typo fails before hours of wall time are spent.
+  `EXPERIMENT_NAME` gets the same pre-flight treatment (whitespace-free token, because it
+  travels as a system property to a forked JVM).
 - Never launch `sbatch`, `run-llm-workload.sh` or `python run_queue.py start` as part of
   a task without explicit approval. `--dry-run`, `list` and `estimate_requests.py` are
   the safe verifications.

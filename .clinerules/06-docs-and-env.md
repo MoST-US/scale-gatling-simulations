@@ -27,7 +27,7 @@ paths:
 ## .env.example
 - It is the tracked schema for `.env`: every key
   `SimulationConfig`/`LLMWorkloadSimulation` reads appears there with a short inline
-  comment, and nothing else.
+  comment, plus the launcher-level run-identity key (`EXPERIMENT_NAME`); nothing else.
 - Values must be paste-safe and secret-free - no real credentials, no `user@host` from
   `setup_tunnels.*`. Generic placeholders only.
 - Keep the example values consistent with the Java defaults in `SimulationConfig.load()`.

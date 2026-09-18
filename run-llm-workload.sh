@@ -53,25 +53,87 @@ validate_rate_limits() {
   done
 }
 
+# EXPERIMENT_NAME prefixes the Gatling report folder
+# (target/gatling/<EXPERIMENT_NAME>-<timestamp>). Gatling receives it as a system
+# property, so keep it whitespace- and filesystem-safe.
+validate_experiment_name() {
+  local name="$1"
+  if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "ERROR: EXPERIMENT_NAME must match [A-Za-z0-9][A-Za-z0-9._-]* with no whitespace: '$name'" >&2
+    exit 1
+  fi
+}
+
 user_rate_limits="${USER_RATE_LIMITS:-10,20,40}"
 validate_rate_limits "$user_rate_limits"
 
-runId="llm-workload-$(date +%Y%m%d%H%M%S)"
-echo "Starting run $runId (USER_RATE_LIMITS=$user_rate_limits units/min, basic/standard/pro)"
+experiment_name="${EXPERIMENT_NAME:-llm-workload}"
+validate_experiment_name "$experiment_name"
 
-if [[ -f target/gatling-llm-simulations-0.1.0-SNAPSHOT.jar && "${USE_JAR:-false}" == "true" ]]; then
+# runId is only the human/log label of this execution; Gatling names the report
+# folder after the experiment name.
+runId="$experiment_name-$(date +%Y%m%d%H%M%S)"
+echo "Starting run $runId (EXPERIMENT_NAME=$experiment_name, USER_RATE_LIMITS=$user_rate_limits units/min, basic/standard/pro)"
+
+jar_path="target/gatling-llm-simulations-0.1.0-SNAPSHOT.jar"
+if [[ -f "$jar_path" && "${USE_JAR:-false}" == "true" ]]; then
+  launcher_command="java $JAVA_OPTS -Dgatling.core.checkVersion=false"
+  launcher_command+=" -Dgatling.core.outputDirectoryBaseName=$experiment_name"
+  launcher_command+=" -DUSER_RATE_LIMITS=$user_rate_limits"
+  launcher_command+=" -jar $jar_path -s simulations.LLMWorkloadSimulation -rf target/gatling"
   # shellcheck disable=SC2086
   java $JAVA_OPTS \
     -Dgatling.core.checkVersion=false \
-    -Dgatling.runId="$runId" \
+    -Dgatling.core.outputDirectoryBaseName="$experiment_name" \
     -DUSER_RATE_LIMITS="$user_rate_limits" \
-    -jar target/gatling-llm-simulations-0.1.0-SNAPSHOT.jar \
+    -jar "$jar_path" \
     -s simulations.LLMWorkloadSimulation -rf target/gatling
 else
+  launcher_command="sh ./mvnw -o -Dmaven.repo.local=$ROOT_DIR/local-repo"
+  launcher_command+=" -Dgatling.core.outputDirectoryBaseName=$experiment_name"
+  launcher_command+=" -DUSER_RATE_LIMITS=$user_rate_limits"
+  launcher_command+=" gatling:test -Dgatling.simulationClass=simulations.LLMWorkloadSimulation"
   sh ./mvnw -o \
     -Dmaven.repo.local="$ROOT_DIR/local-repo" \
-    -Dgatling.runId="$runId" \
+    -Dgatling.core.outputDirectoryBaseName="$experiment_name" \
     -DUSER_RATE_LIMITS="$user_rate_limits" \
     gatling:test \
     -Dgatling.simulationClass=simulations.LLMWorkloadSimulation
 fi
+
+# Gatling writes target/gatling/<experiment_name>-<yyyyMMddHHmmssSSS>/; copy the
+# configuration that this execution used into that folder so every report is
+# self-describing. The zero-padded timestamp makes the greatest match the newest
+# folder. This bookkeeping must never fail an otherwise successful run.
+write_used_config() {
+  local report_dir=""
+  local candidate
+  for candidate in "target/gatling/$experiment_name"-*; do
+    if [[ -d "$candidate" && ( -z "$report_dir" || "$candidate" > "$report_dir" ) ]]; then
+      report_dir="$candidate"
+    fi
+  done
+  if [[ -z "$report_dir" ]]; then
+    echo "WARNING: no report folder matching target/gatling/$experiment_name-* was found; skipping used_config.txt." >&2
+    return 0
+  fi
+  {
+    echo "# used_config.txt - effective configuration of this Gatling run"
+    echo "# experiment : $experiment_name"
+    echo "# run id     : $runId"
+    echo "# report dir : $report_dir"
+    echo "# started    : $(date '+%Y-%m-%dT%H:%M:%S%z')"
+    echo "# source     : .env (launcher override: USER_RATE_LIMITS=$user_rate_limits)"
+    echo "# command    : $launcher_command"
+    echo
+    if [[ -f .env ]]; then
+      grep -v -E '^[[:space:]]*(export[[:space:]]+)?USER_RATE_LIMITS[[:space:]]*=' .env || true
+    else
+      echo "# .env was not present; only the values passed on the command line apply"
+    fi
+    echo "USER_RATE_LIMITS=$user_rate_limits"
+  } > "$report_dir/used_config.txt"
+  echo "Configuration recorded in $report_dir/used_config.txt"
+}
+
+write_used_config || echo "WARNING: could not write used_config.txt." >&2

@@ -44,6 +44,7 @@ Important settings include:
 LLM_URL=gpu06:9000
 ENDPOINT_PATH=/v1/completions
 MODELS_ENDPOINT=/v1/models
+EXPERIMENT_NAME=llm-workload
 SIMULATION_MINUTES=60
 USER_RAMP_MINUTES=30
 FIRST_REQUEST_BATCH_SIZE=500
@@ -67,6 +68,14 @@ each user at the configured rate. A request consumes `UNITS_PER_REQUEST` units, 
 `UNITS_PER_REQUEST=100` so integer unit budgets can represent fractions of a
 request per minute. A user that lacks units records `insufficient-units` for
 that attempt but remains in the simulation for later requests.
+
+Each execution writes its Gatling report to
+`target/gatling/<EXPERIMENT_NAME>-<timestamp>/`, and that folder also receives a
+`used_config.txt` with the configuration the run actually used. `EXPERIMENT_NAME`
+(default `llm-workload`) is used by `run-llm-workload.sh` and
+`submit_llm_workload.sbatch`; queued runs use the queued run name instead (see
+[Section 4](#4-run-a-queue-of-executions-run_queuepy)). Keep `EXPERIMENT_NAME` free
+of whitespace (`[A-Za-z0-9][A-Za-z0-9._-]*`).
 
 The same reproducible stochastic demand schedule is generated for every run, so
 only `USER_RATE_LIMITS` (and any other parameter you override) changes between
@@ -98,6 +107,9 @@ sh ./mvnw -o \
 	gatling:test \
 	-Dgatling.simulationClass=simulations.LLMWorkloadSimulation
 ```
+
+Each execution writes its report to `target/gatling/<EXPERIMENT_NAME>-<timestamp>/`,
+next to a `used_config.txt` recording the effective configuration of that run.
 
 For a background SLURM job, submit from the repository directory:
 
@@ -181,13 +193,18 @@ queue/pending/<name>.env    enqueued, waiting
 queue/running/<name>.env    claimed; the execution is running
 queue/done/<name>.env       finished OK
 queue/failed/<name>.env     finished with an error
-results/runs.jsonl          append-only audit log (item events + runId, params, status, exit code)
+results/runs.jsonl          append-only audit log (item events + runId, params, status,
+                            exit code, report directory)
 logs/<runId>.log            Gatling console output
+target/gatling/<name>-<timestamp>/
+                            Gatling report of that run (created by Gatling, not the queue)
 ```
 
-Each item gets a unique `runId=<name>-<timestamp>`, so its Gatling report lands in
-its own `target/gatling/<runId>/` directory. `run_queue.py` works on Windows
-(`mvnw.cmd`) and Linux/SLURM (`./mvnw`).
+The queued run name is the experiment name of that execution: the report lands in
+its own `target/gatling/<name>-<yyyyMMddHHmmssSSS>/` directory, together with a
+`used_config.txt` holding the configuration the run actually used (the base `.env`
+merged with the item's overrides). `run_queue.py` works on Windows (`mvnw.cmd`) and
+Linux/SLURM (`./mvnw`).
 
 #### 4.1 Quick start (local)
 
@@ -275,8 +292,10 @@ python3 run_queue.py list                 # queue state (run from the submit dir
 (check with `sacct -j <job-id>`):
 
 ```
-target/gatling/<runId>/    Gatling reports, one directory per run
-results/runs.jsonl         audit log (item events plus params, runId, status, exit code)
+target/gatling/<name>-<timestamp>/
+                           Gatling reports plus used_config.txt, one directory per run
+results/runs.jsonl         audit log (item events plus params, runId, status, exit code,
+                           report directory and used_config path)
 logs/<runId>.log           console output (for debugging failed runs)
 queue/done/                run files that finished OK
 queue/failed/              run files that failed (the worker keeps going)
@@ -362,11 +381,11 @@ Design notes:
   run concurrently and would defeat the sequential FIFO behavior.
 - A failed run does not stop the worker; the job only exits non-zero at the end
   (`--once` mode). Check `logs/<runId>.log`, the `finished` record in
-  `results/runs.jsonl` (it carries `run_id`, status and exit code), or
-  `run_queue.py list`.
+  `results/runs.jsonl` (it carries `run_id`, status, exit code and the report
+  directory), or `run_queue.py list`.
 - `run-llm-workload.sh` plus `submit_llm_workload.sbatch` remain a direct,
-  non-queued way to run one execution. Use the queue when several runs should run
-  unattended.
+  non-queued way to run one execution; that path names the report folder after
+  `EXPERIMENT_NAME`. Use the queue when several runs should run unattended.
 
 ## Workload Timing & Generation
 

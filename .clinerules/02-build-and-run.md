@@ -28,10 +28,17 @@ sh ./mvnw -o -Dmaven.repo.local="$PWD/local-repo" gatling:test \
   -Dgatling.simulationClass=simulations.LLMWorkloadSimulation
 ```
 
-`run-llm-workload.sh` wraps that same call, adds `-Dgatling.runId`, raises `ulimit -n` to
+`run-llm-workload.sh` wraps that same call, adds
+`-Dgatling.core.outputDirectoryBaseName=<EXPERIMENT_NAME>`, raises `ulimit -n` to
 `GATLING_NOFILE_LIMIT` (default 65535) and sets `MAVEN_OPTS`/`JAVA_OPTS` (default
 `-Xmx4g`). Keep the memory and file-descriptor limits; the generator, not the LLM, is
 usually the bottleneck above 10k users. Never lower them.
+
+Reports land in `target/gatling/<EXPERIMENT_NAME>-<yyyyMMddHHmmssSSS>/` (queued runs:
+`target/gatling/<queued run name>-<timestamp>/`), and the launcher or queue drops a
+`used_config.txt` with the effective configuration of that run into the folder.
+`gatling.runId` is not a Gatling 3.10.5 property - it silently does nothing; the report
+folder name always comes from `gatling.core.outputDirectoryBaseName`.
 
 Queue inspection (safe, non-executing):
 
