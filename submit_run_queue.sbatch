@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=24:00:00
-#SBATCH --nodelist=c06
+#SBATCH --nodelist=c09
 
 # Drain or watch the run queue on a dedicated compute node. Items from
 # queue/pending/ are executed strictly one at a time (FIFO) by run_queue.py: each
