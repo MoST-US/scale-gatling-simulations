@@ -23,12 +23,11 @@ Model (mirrors the Java sources in src/main/java/simulations):
          floor((UNITS_PER_REQUEST + tierUnitsPerMinute * SIMULATION_MINUTES)
                / UNITS_PER_REQUEST)
      attempts (initial bank = UNITS_PER_REQUEST, continuous refill afterwards;
-     the refill rate is the tier budget passed by run-llm-workload.sh as
-     -DBASIC/STANDARD/PRO_UNITS_PER_MINUTE from the *_TEST triplets).
+     the refill rate is the per-tier budget from the USER_RATE_LIMITS triplet,
+     passed by the launcher as -DUSER_RATE_LIMITS=<basic>,<standard>,<pro>).
 
-run-llm-workload.sh executes the three provisioning cases in sequence with the
-same generated schedule, so this tool reports per-case numbers plus a grand
-total across the three runs.
+run-llm-workload.sh executes a single run with that generated schedule, so this
+tool reports the numbers for that one execution.
 
 Usage:
     python estimate_requests.py [--env PATH] [--set KEY=VALUE]... [--json]
@@ -74,16 +73,8 @@ DEFAULTS = {
     "INTERACT_DURING_RAMP": "false",
     "FIRST_REQUEST_BATCH_SIZE": "500",
     "FIRST_REQUEST_TURN_INTERVAL_SECONDS": "2",
-    "UNDER_PROVISIONING_TEST": "10,20,30",
-    "OVER_PROVISIONING_TEST": "10000,10000,10000",
-    "FINE_TUNED_TEST": "25,40,50",
+    "USER_RATE_LIMITS": "10,20,40",
 }
-
-CASES = [
-    ("under-provisioning", "UNDER_PROVISIONING_TEST"),
-    ("over-provisioning", "OVER_PROVISIONING_TEST"),
-    ("fine-tuned-provisioning", "FINE_TUNED_TEST"),
-]
 
 
 def parse_env_value(raw: str) -> str:
@@ -148,15 +139,6 @@ def parse_triplet(name: str, value: str) -> list:
             f"error: {name} must contain exactly three comma-separated unit values: {value!r}"
         )
     return [int(p) for p in parts]
-
-
-def oversubscription_rate(settings: dict) -> list:
-    """Per-tier ratio of fine-tuned to under-provisioned unit budgets,
-    in [basic, standard, pro] order. A zero under-provisioned budget yields
-    None for that tier."""
-    under = parse_triplet("UNDER_PROVISIONING_TEST", settings["UNDER_PROVISIONING_TEST"])
-    fine = parse_triplet("FINE_TUNED_TEST", settings["FINE_TUNED_TEST"])
-    return [fine[i] / under[i] if under[i] != 0 else None for i in range(len(under))]
 
 
 def usage_split(count: int, high_share: float, low_hourly: float, high_hourly: float) -> list:
@@ -257,32 +239,17 @@ def fmt(x: float) -> str:
 
 
 def build_report(settings: dict, env_path: str, user_info: dict, units_per_request: int) -> dict:
-    cases = []
-    for name, key in CASES:
-        upm = tuple(parse_triplet(key, settings[key]))
-        stats = case_stats(user_info, upm, units_per_request)
-        stats["name"] = name
-        stats["units_per_minute"] = list(upm)
-        stats["demand_per_minute"] = (
-            stats["attempts"]["mean"] / user_info["sim_minutes"] if user_info["sim_minutes"] > 0 else 0.0
-        )
-        stats["success_rate"] = (
-            stats["http"]["mean"] / stats["attempts"]["mean"] if stats["attempts"]["mean"] > 0 else 0.0
-        )
-        cases.append(stats)
-
-    total_attempts = {"mean": 0.0, "min": 0, "max": 0}
-    total_http = {"mean": 0.0, "min": 0, "max": 0}
-    for c in cases:
-        for key in ("mean", "min", "max"):
-            total_attempts[key] += c["attempts"][key]
-            total_http[key] += c["http"][key]
-    grand = {
-        "attempts": total_attempts,
-        "http": total_http,
-        "insufficient_units": total_attempts["mean"] - total_http["mean"],
-    }
-    return {"cases": cases, "grand_total": grand}
+    upm = tuple(parse_triplet("USER_RATE_LIMITS", settings["USER_RATE_LIMITS"]))
+    report = case_stats(user_info, upm, units_per_request)
+    report["units_per_minute"] = list(upm)
+    report["demand_per_minute"] = (
+        report["attempts"]["mean"] / user_info["sim_minutes"] if user_info["sim_minutes"] > 0 else 0.0
+    )
+    report["success_rate"] = (
+        report["http"]["mean"] / report["attempts"]["mean"] if report["attempts"]["mean"] > 0 else 0.0
+    )
+    report["insufficient_units"] = report["attempts"]["mean"] - report["http"]["mean"]
+    return report
 
 
 def print_config(settings: dict, env_path: str, user_info: dict) -> None:
@@ -308,6 +275,10 @@ def print_config(settings: dict, env_path: str, user_info: dict) -> None:
     print(
         f"  Max accumulated requests       : {settings['MAX_ACCUMULATED_REQUESTS']}  "
         "(burst cap; total volume unchanged)"
+    )
+    print(
+        f"  USER_RATE_LIMITS               : {settings['USER_RATE_LIMITS']}  "
+        "(basic,standard,pro units/min)"
     )
     print(
         f"  Ramp / interact during ramp    : {settings['USER_RAMP_MINUTES']} min / "
@@ -338,42 +309,24 @@ def print_schedule(user_info: dict) -> None:
     )
 
 
-def print_cases(report: dict) -> None:
-    print("Per provisioning case (each is one full sequential run)")
-    for c in report["cases"]:
-        upm = c["units_per_minute"]
-        a, h = c["attempts"], c["http"]
-        print(f"{c['name']}")
-        print(f"  units/min (basic/standard/pro) : {upm[0]:,} / {upm[1]:,} / {upm[2]:,}")
-        print(f"  aggregate entitlement          : {c['entitlement_per_minute']:,.0f} requests/minute")
-        print(f"  attempts                       : {fmt(a['mean'])}  (range {fmt(a['min'])} .. {fmt(a['max'])})")
-        print(
-            f"  HTTP requests                  : {fmt(h['mean'])}  ({c['success_rate']:.1%} of attempts; "
-            f"range {fmt(h['min'])} .. {fmt(h['max'])})"
-        )
-        print(f"  insufficient-units             : {fmt(a['mean'] - h['mean'])}")
-        ent, dem = c["entitlement_per_minute"], c["demand_per_minute"]
-        if ent < dem:
-            verdict = f"entitlement ({ent:,.0f}/min) < demand ({dem:,.0f}/min) -> quota-bound, insufficient-units expected"
-        else:
-            verdict = f"entitlement ({ent:,.0f}/min) >= demand ({dem:,.0f}/min) -> every attempt can be fulfilled"
-        print(f"  verdict                        : {verdict}")
-
-
-def print_oversubscription(settings: dict) -> None:
-    print("Oversubscription rate (fine-tuned / under-provisioned, basic/standard/pro)")
-    print(f"  {oversubscription_rate(settings)}")
-
-
-def print_grand(report: dict) -> None:
-    g = report["grand_total"]
-    print("Grand total across the 3 sequential runs")
+def print_run(report: dict) -> None:
+    print("Provisioning run (one full execution)")
+    upm = report["units_per_minute"]
+    a, h = report["attempts"], report["http"]
+    print(f"  units/min (basic/standard/pro) : {upm[0]:,} / {upm[1]:,} / {upm[2]:,}")
+    print(f"  aggregate entitlement          : {report['entitlement_per_minute']:,.0f} requests/minute")
+    print(f"  attempts                       : {fmt(a['mean'])}  (range {fmt(a['min'])} .. {fmt(a['max'])})")
     print(
-        f"  Attempts           : {fmt(g['attempts']['mean'])}  "
-        f"(range {fmt(g['attempts']['min'])} .. {fmt(g['attempts']['max'])}; includes looseness jitter)"
+        f"  HTTP requests                  : {fmt(h['mean'])}  ({report['success_rate']:.1%} of attempts; "
+        f"range {fmt(h['min'])} .. {fmt(h['max'])})"
     )
-    print(f"  HTTP requests      : {fmt(g['http']['mean'])}  (expected value)")
-    print(f"  Insufficient-units : {fmt(g['insufficient_units'])}")
+    print(f"  insufficient-units             : {fmt(report['insufficient_units'])}")
+    ent, dem = report["entitlement_per_minute"], report["demand_per_minute"]
+    if ent < dem:
+        verdict = f"entitlement ({ent:,.0f}/min) < demand ({dem:,.0f}/min) -> quota-bound, insufficient-units expected"
+    else:
+        verdict = f"entitlement ({ent:,.0f}/min) >= demand ({dem:,.0f}/min) -> every attempt can be fulfilled"
+    print(f"  verdict                        : {verdict}")
     print()
     print("Roughness: request timings are random inside uniform slots, so real counts can")
     print("differ by a few requests per user at the quota boundary; means are expected totals.")
@@ -384,11 +337,7 @@ def print_report(settings: dict, env_path: str, user_info: dict, units_per_reque
     print()
     print_schedule(user_info)
     print()
-    print_cases(report)
-    print()
-    print_oversubscription(settings)
-    print()
-    print_grand(report)
+    print_run(report)
 
 
 def main(argv=None) -> int:
@@ -420,20 +369,15 @@ def main(argv=None) -> int:
             "env_file": env_path,
             "config": settings,
             "users": user_info,
-            "oversubscription_rate": oversubscription_rate(settings),
-            "cases": [
-                {
-                    "name": c["name"],
-                    "units_per_minute": c["units_per_minute"],
-                    "entitlement_per_minute": c["entitlement_per_minute"],
-                    "demand_per_minute": c["demand_per_minute"],
-                    "success_rate": c["success_rate"],
-                    "attempts": c["attempts"],
-                    "http": c["http"],
-                }
-                for c in report["cases"]
-            ],
-            "grand_total": report["grand_total"],
+            "case": {
+                "units_per_minute": report["units_per_minute"],
+                "entitlement_per_minute": report["entitlement_per_minute"],
+                "demand_per_minute": report["demand_per_minute"],
+                "success_rate": report["success_rate"],
+                "attempts": report["attempts"],
+                "http": report["http"],
+                "insufficient_units": report["insufficient_units"],
+            },
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:

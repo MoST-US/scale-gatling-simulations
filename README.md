@@ -13,13 +13,13 @@ their quota, the next attempted request is recorded as a Gatling failure named
 `insufficient-units`, and that user stops. HTTP errors remain separate from
 quota failures.
 
-Three provisioning experiments run in sequence: under-provisioning,
-over-provisioning, and fine-tuned provisioning. Their tier quotas are read from
-`.env` and passed to each case as JVM properties.
+Each execution applies one per-user entitlement profile: `USER_RATE_LIMITS`, a
+`basic,standard,pro` triplet of units per minute read from `.env` and passed to
+the simulation as a JVM property.
 
-Both entry points run the same three experiments: `run-llm-workload.sh` executes
-them directly, and one queued run in `run_queue.py` is a full sweep of the same
-three cases (see [Section 4](#4-run-a-queue-of-executions-run_queuepy)).
+To compare several provisioning profiles, enqueue one run per profile; queueing
+runs with different `USER_RATE_LIMITS` replaces the former multi-case "sweep"
+(see [Section 4](#4-run-a-queue-of-executions-run_queuepy)).
 
 ## Setup
 
@@ -54,15 +54,13 @@ FIRST_REQUEST_TURN_INTERVAL_SECONDS=2
 bare host and port to `http://...`. The model is discovered automatically from
 `MODELS_ENDPOINT`.
 
-The provisioning values use this format:
+The per-user entitlement is a single triplet:
 
 ```dotenv
-UNDER_PROVISIONING_TEST=2,3,4
-OVER_PROVISIONING_TEST=10000,10000,10000
-FINE_TUNED_TEST=5,8,10                
+USER_RATE_LIMITS=4,8,10
 ```
 
-Each triplet is `basic,standard,pro` units per minute.
+It is `basic,standard,pro` units per minute.
 Units are not a lifetime quota. In the simulation they refill continuously for
 each user at the configured rate. A request consumes `UNITS_PER_REQUEST` units, and
 `MAX_ACCUMULATED_REQUESTS` bounds the per-user burst capacity. The example uses
@@ -70,24 +68,10 @@ each user at the configured rate. A request consumes `UNITS_PER_REQUEST` units, 
 request per minute. A user that lacks units records `insufficient-units` for
 that attempt but remains in the simulation for later requests.
 
-### Oversubscription rate
-
-When an experiment ends, `run-llm-workload.sh` appends one JSON object per run to
-`results/oversubscription-rate.jsonl` (the `results/` directory is created when
-needed). A queued run does the same once its three cases have completed; its
-record additionally carries the queue item name (`run`) and the three runIds
-(`run_ids`) so queue and script records can be told apart and correlated. The
-oversubscription rate is the per-tier relative difference between
-the fine-tuned and under-provisioned unit budgets, in `[basic, standard, pro]`
-order, stored as exact decimals:
-
-    oversubscription_rate[i] = FINE_TUNED_TEST[i] / UNDER_PROVISIONING_TEST[i]
-
-With the example values above (`FINE_TUNED_TEST=5,8,10` and
-`UNDER_PROVISIONING_TEST=2,3,4`) the rate is `[2.5, 2.67, 2.5]`. A zero
-under-provisioned budget is stored as `null` for that tier. The same value is
-shown by `estimate_requests.py` (text or `--json` report) without running the
-simulation.
+The same reproducible stochastic demand schedule is generated for every run, so
+only `USER_RATE_LIMITS` (and any other parameter you override) changes between
+them. `estimate_requests.py` reports the expected request volume for a given
+`USER_RATE_LIMITS` (text or `--json` report) without running the simulation.
 
 ### 3. Run the simulation
 
@@ -144,50 +128,48 @@ SLURM writes logs to `gatling-llm-workload-<job-id>.out` and
 
 ### 4. Run a queue of executions (`run_queue.py`)
 
-`run_queue.py` runs several sweeps back-to-back (strictly one at a time, FIFO) so
-you never have to watch for one execution to end before starting the next —
-enqueue as many runs as you want, each with different parameters, and the worker
-picks them up automatically.
+`run_queue.py` runs several executions back-to-back (strictly one at a time,
+FIFO) so you never have to watch for one execution to end before starting the
+next — enqueue as many runs as you want, each with different parameters, and the
+worker picks them up automatically.
 
-**One queued run is a full sweep: the three provisioning experiments, run in
-sequence.** The worker expands the item into `under-provisioning`,
-`over-provisioning` and `fine-tuned-provisioning` (the same order as
-`run-llm-workload.sh`), each as its own Gatling execution with its own runId, log
-file and report directory. The next item in the queue only starts once **all
-three cases** of the current item have finished.
+**One queued run is one Gatling execution.** A queued "run" is a small
+`.env`-style file in `queue/pending/<name>.env` holding only the parameters that
+differ from the base `.env`. The worker merges the item's overrides over `.env`
+and passes every merged key as a `-D` JVM property (which takes precedence), so
+no Java code changes are needed and *any* parameter (`TOTAL_USERS`,
+`SIMULATION_MINUTES`, `USER_RATE_LIMITS`, `LLM_URL`, `LLM_PROMPT`, ...) can differ
+per run.
 
-A queued "run" is a small `.env`-style file in `queue/pending/<name>.env`
-holding only the parameters that differ from the base `.env`, plus
-`QUEUE_MODE=SWEEP`. For each case the worker merges the item's overrides over
-`.env`, sets that case's tier quotas from its `*_TEST` triplet and passes every
-merged key as a `-D` JVM property (which takes precedence), so no Java code
-changes are needed and *any* parameter (`TOTAL_USERS`, `SIMULATION_MINUTES`,
-`LLM_URL`, `LLM_PROMPT`, ...) can differ per run.
+To compare provisioning profiles, enqueue one run per `USER_RATE_LIMITS` value.
+This is how the former multi-case "sweep" is reproduced — for example, the three
+under/over/fine-tuned profiles become three queue items:
 
-A case that exits non-zero stops the sweep (mirroring the `set -e` behavior of
-`run-llm-workload.sh`): the remaining cases are skipped, the item is moved to
-`queue/failed/`, and the worker continues with the next item. Only completed
-sweeps append a record to `results/oversubscription-rate.jsonl`.
+```bash
+python run_queue.py add under --set USER_RATE_LIMITS=25,50,75
+python run_queue.py add over  --set USER_RATE_LIMITS=10000,10000,10000
+python run_queue.py add tuned --set USER_RATE_LIMITS=50,100,150
+```
 
-`add --single` enqueues a plain isolated execution (one run, no case expansion)
-for spot checks and parameter experiments.
+A run that exits non-zero is moved to `queue/failed/`, and the worker continues
+with the next item (mirroring the `set -e` behavior of `run-llm-workload.sh` for
+that single run).
 
 Commands (run from the repository directory):
 
 ```bash
-python run_queue.py add <name> [--set KEY=VALUE ...] [--env-file PATH] [--single]
-    Enqueue a run named <name> (a three-case sweep unless --single is given).
+python run_queue.py add <name> [--set KEY=VALUE ...] [--env-file PATH]
+    Enqueue a run named <name> (one execution).
     --set overrides a parameter (repeatable); --env-file imports overrides from
-    an .env-style file. --single enqueues one isolated execution.
+    an .env-style file.
 python run_queue.py start [--once]
     Process the queue. --once drains what is pending now, then exits with
     code 0 (or 1 if any run failed). Without --once it keeps polling for
     newly added runs until Ctrl-C.
 python run_queue.py run <name> --dry-run
-    Print the exact Maven command of every case without executing it.
+    Print the exact Maven command without executing it.
 python run_queue.py list [--json]
-    Show pending / running / done / failed items (with their mode) and recent
-    activity.
+    Show pending / running / done / failed items and recent activity.
 python run_queue.py clear [--done] [--failed] [--all]
     Remove processed run files (done and failed by default).
 ```
@@ -196,34 +178,31 @@ Directory layout (created on demand, git-ignored):
 
 ```
 queue/pending/<name>.env    enqueued, waiting
-queue/running/<name>.env    claimed; its sweep is executing
-queue/done/<name>.env       all cases finished OK
-queue/failed/<name>.env     at least one case failed
-results/runs.jsonl          append-only audit log (item events + per-case events)
-results/oversubscription-rate.jsonl  one record per completed sweep
-logs/<runId>.log            per-case Gatling console output
+queue/running/<name>.env    claimed; the execution is running
+queue/done/<name>.env       finished OK
+queue/failed/<name>.env     finished with an error
+results/runs.jsonl          append-only audit log (item events + runId, params, status, exit code)
+logs/<runId>.log            Gatling console output
 ```
 
-Each **case** gets a unique `runId=<name>-<case>-<timestamp>`, so its Gatling
-report lands in its own `target/gatling/<runId>/` directory (a `--single` item uses
-`runId=<name>-<timestamp>`). `run_queue.py` works on Windows (`mvnw.cmd`) and
-Linux/SLURM (`./mvnw`).
+Each item gets a unique `runId=<name>-<timestamp>`, so its Gatling report lands in
+its own `target/gatling/<runId>/` directory. `run_queue.py` works on Windows
+(`mvnw.cmd`) and Linux/SLURM (`./mvnw`).
 
 #### 4.1 Quick start (local)
 
 ```bash
-# Enqueue two sweeps with different parameters (3 cases each = 6 executions):
+# Enqueue two runs with different parameters:
 python run_queue.py add baseline  --set TOTAL_USERS=500   --set SIMULATION_MINUTES=30
 python run_queue.py add full-load --set TOTAL_USERS=20000 --set SIMULATION_MINUTES=60
 
-# Or a single isolated execution (1 execution):
-python run_queue.py add spot-check --single --set BASIC_UNITS_PER_MINUTE=50
+# Enqueue a different rate-limit profile:
+python run_queue.py add spot-check --set USER_RATE_LIMITS=10000,10000,10000
 
-# Inspect the plan before committing hours of wall time:
+# Inspect the command before committing hours of wall time:
 python run_queue.py run full-load --dry-run
 
-# Drain the queue (items run one at a time in enqueue order, and each item's
-# three cases run sequentially):
+# Drain the queue (items run one at a time in enqueue order):
 python run_queue.py start --once        # exit code 1 if any run failed
 
 # Or keep running until Ctrl-C, picking up runs as they are added:
@@ -252,24 +231,21 @@ python3 --version               # run_queue.py needs only the Python 3 standard 
 
 **Step 2 — enqueue your runs.** `run_queue.py` must run in the same directory
 that SLURM will process (the submit directory), because that is where it reads
-`.env` and `queue/`. One enqueued run already covers the whole experiment, because
-it sweeps the three provisioning cases (their quotas come from the `*_TEST`
-triplets in `.env`):
+`.env` and `queue/`. Each enqueued run is one execution, so queue one item per
+parameter set you want to compare:
 
 ```bash
 python3 run_queue.py add experiment-1 --set TOTAL_USERS=10000
 python3 run_queue.py add experiment-2 --set TOTAL_USERS=20000 --set SIMULATION_MINUTES=90
-python3 run_queue.py run experiment-1 --dry-run   # optional: show the 3 commands
+python3 run_queue.py run experiment-1 --dry-run   # optional: show the command
 python3 run_queue.py list                         # sanity-check the pending queue
 ```
 
-To change the tier quotas for one queued run, override its **triplets** — not the
-per-case `BASIC/STANDARD/PRO_UNITS_PER_MINUTE` keys, which the sweep derives from
-them (`add` rejects those on a sweep item):
+To change the per-user entitlement for one run, override `USER_RATE_LIMITS` with a
+`basic,standard,pro` triplet of units per minute:
 
 ```bash
-python3 run_queue.py add generous \
-  --set UNDER_PROVISIONING_TEST=25,50,75 --set FINE_TUNED_TEST=60,120,180
+python3 run_queue.py add generous --set USER_RATE_LIMITS=75,150,225
 ```
 
 **Step 3 — submit the batch job:**
@@ -286,7 +262,7 @@ The job runs `python3 run_queue.py start --once`: it drains the queue, then exit
 with code 0 (drained, or nothing pending) or 1 (at least one run failed), so
 SLURM reports the job as `COMPLETED` or `FAILED` accordingly.
 
-**Step 4 — monitor.** The worker prints one line per case start/end to the job
+**Step 4 — monitor.** The worker prints one line per run start/end to the job
 output file; the queue state and audit log are updated on disk:
 
 ```bash
@@ -299,12 +275,11 @@ python3 run_queue.py list                 # queue state (run from the submit dir
 (check with `sacct -j <job-id>`):
 
 ```
-target/gatling/<runId>/    Gatling reports, one directory per case
-results/runs.jsonl         audit log (item events plus per-case params, runId, status, exit code)
-results/oversubscription-rate.jsonl  one record per completed sweep
-logs/<runId>.log           per-case console output (for debugging failed runs)
-queue/done/                run files whose three cases all finished
-queue/failed/              run files with a failed case (the worker keeps going)
+target/gatling/<runId>/    Gatling reports, one directory per run
+results/runs.jsonl         audit log (item events plus params, runId, status, exit code)
+logs/<runId>.log           console output (for debugging failed runs)
+queue/done/                run files that finished OK
+queue/failed/              run files that failed (the worker keeps going)
 ```
 
 ##### The batch script (`submit_run_queue.sbatch`)
@@ -322,8 +297,8 @@ queue/failed/              run files with a failed case (the worker keeps going)
 #SBATCH --nodelist=c06
 
 # Drain or watch the run queue on a dedicated compute node. Items from
-# queue/pending/ are executed strictly one at a time (FIFO) by run_queue.py, and
-# each item first runs its three provisioning cases in sequence.
+# queue/pending/ are executed strictly one at a time (FIFO) by run_queue.py;
+# each item is one Gatling execution.
 #
 # Usage:
 #   sbatch submit_run_queue.sbatch            # once mode (default): drain queue, then exit
@@ -365,14 +340,14 @@ fi
 What matters in it:
 
 - `#SBATCH --time=...` is the **total** allowed wall time for the whole queue.
-  Budget `3 × (USER_RAMP_MINUTES + SIMULATION_MINUTES)` per queued run, because
-  every item sweeps three cases, plus 10–15 minutes of overhead per case
-  (schedule generation, model resolution, and report writing). With the default
-  `.env` (`USER_RAMP_MINUTES=30`, `SIMULATION_MINUTES=60`) that is roughly 5 hours
-  per item, so the `--time=24:00:00` default fits about four items. If a case
-  starts too close to the limit, the job is killed mid-run — the interrupted item
-  is left in `queue/running/` and automatically requeued by the next `start` (its
-  sweep restarts from the first case; reports already written are kept).
+  Budget `USER_RAMP_MINUTES + SIMULATION_MINUTES` per queued run, plus 10–15
+  minutes of overhead (schedule generation, model resolution, and report
+  writing). With the default `.env` (`USER_RAMP_MINUTES=30`,
+  `SIMULATION_MINUTES=60`) that is roughly 1.5 hours per item, so the
+  `--time=24:00:00` default fits many items. If a run starts too close to the
+  limit, the job is killed mid-run — the interrupted item is left in
+  `queue/running/` and automatically requeued by the next `start` (reports already
+  written are kept).
 - `#SBATCH --nodelist=` is overridable per submission with
   `sbatch --nodelist=c07 ...` or via the `./submit_run_queue.sh c07` helper.
 - `once` mode is the recommended pattern: enqueue everything up front, bound the
@@ -382,18 +357,16 @@ What matters in it:
 
 Design notes:
 
-- Runs execute **strictly sequentially in enqueue order**, and the three cases of
-  a sweep run sequentially too, which is the whole point of the queue. Do **not**
-  convert this to a SLURM job array — array tasks run concurrently and would
-  defeat the sequential FIFO behavior.
-- A failed case does not stop the worker; the job only exits non-zero at the end
-  (`--once` mode). A sweep stops at its first failing case, so an item in
-  `queue/failed/` may have produced fewer than three reports. Check
-  `logs/<runId>.log`, the `finished` record in `results/runs.jsonl` (it carries
-  `failed_case` and `cases_completed`), or `run_queue.py list`.
+- Runs execute **strictly sequentially in enqueue order**, which is the whole
+  point of the queue. Do **not** convert this to a SLURM job array — array tasks
+  run concurrently and would defeat the sequential FIFO behavior.
+- A failed run does not stop the worker; the job only exits non-zero at the end
+  (`--once` mode). Check `logs/<runId>.log`, the `finished` record in
+  `results/runs.jsonl` (it carries `run_id`, status and exit code), or
+  `run_queue.py list`.
 - `run-llm-workload.sh` plus `submit_llm_workload.sbatch` remain a direct,
-  non-queued way to run the same three-case experiment (identical quotas and
-  ordering). Use the queue when several sweeps should run unattended.
+  non-queued way to run one execution. Use the queue when several runs should run
+  unattended.
 
 ## Workload Timing & Generation
 
@@ -442,11 +415,11 @@ users have arrived.
 **Extensible Design**
 The workload generation system is modular, supporting different distribution strategies through the `WorkloadTrendStrategy` interface. Currently, the uniform distribution strategy ensures consistent workload throughout the experiment. Future strategies could implement peak hours, circadian patterns, or other realistic trends.
 
-The same reproducible stochastic demand schedule is used for all three
-experiments. Only the per-subscription unit budgets change. This models
-statistical multiplexing: the sum of subscription entitlements may be slightly
-above service capacity while users are independently active only part of the
-time.
+The same reproducible stochastic demand schedule is generated for every run.
+Only `USER_RATE_LIMITS` (and any other overridden parameter) changes, so runs
+with different entitlements stay directly comparable. This models statistical
+multiplexing: the sum of subscription entitlements may be slightly above service
+capacity while users are independently active only part of the time.
 
 ## Workload Timing (Legacy)
 

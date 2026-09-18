@@ -325,6 +325,10 @@ public final class SimulationConfig {
       ? resolveModelId(modelResolutionBaseUrl, rawModelsEndpoint)
       : configuredModelId;
 
+    // One comma-separated triplet now carries the per-user rate limits:
+    // USER_RATE_LIMITS=<basic>,<standard>,<pro> units per minute.
+    int[] userRateLimits = readTriplet("USER_RATE_LIMITS", new int[] { 10, 20, 40 });
+
     return new SimulationConfig(
       baseUrl,
       tunnelUrls,
@@ -343,9 +347,9 @@ public final class SimulationConfig {
       readDouble("BASIC_SHARE", 0.7),
       readDouble("STANDARD_SHARE", 0.2),
       readDouble("PRO_SHARE", 0.1),
-      readInt("BASIC_UNITS_PER_MINUTE", 10),
-      readInt("STANDARD_UNITS_PER_MINUTE", 20),
-      readInt("PRO_UNITS_PER_MINUTE", 40),
+      userRateLimits[0],
+      userRateLimits[1],
+      userRateLimits[2],
       readInt("UNITS_PER_REQUEST", 1),
       readInt("MAX_ACCUMULATED_REQUESTS", 1),
       read("LLM_PROMPT", "Hello"),
@@ -376,6 +380,38 @@ public final class SimulationConfig {
     } catch (NumberFormatException ex) {
       return defaultValue;
     }
+  }
+
+  /**
+   * Reads a "basic,standard,pro" triplet of non-negative integers, falling back
+   * to {@code defaults} when the value is missing or malformed.
+   */
+  private static int[] readTriplet(String key, int[] defaults) {
+    String value = read(key, null);
+    if (value != null) {
+      String[] parts = value.split(",", -1);
+      if (parts.length == defaults.length) {
+        int[] parsed = new int[defaults.length];
+        boolean ok = true;
+        for (int i = 0; i < parts.length; i += 1) {
+          try {
+            int entry = Integer.parseInt(parts[i].trim());
+            if (entry < 0) {
+              ok = false;
+              break;
+            }
+            parsed[i] = entry;
+          } catch (NumberFormatException ex) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          return parsed;
+        }
+      }
+    }
+    return defaults.clone();
   }
 
   private static double readDouble(String key, double defaultValue) {

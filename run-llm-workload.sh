@@ -35,79 +35,43 @@ echo "Generator: JAVA_OPTS=$JAVA_OPTS, open files=$(ulimit -n)"
 
 export MAVEN_OPTS="${MAVEN_OPTS:-} $JAVA_OPTS"
 
-parse_case() {
-  local case_name="$1"
-  local values="$2"
+# USER_RATE_LIMITS is the single per-user entitlement knob: a "basic,standard,pro"
+# triplet of units per minute. Validate it here so a typo fails before Java starts.
+validate_rate_limits() {
+  local values="$1"
   local basic_units standard_units pro_units extra units
   IFS="," read -r basic_units standard_units pro_units extra <<< "$values"
   if [[ -n "${extra:-}" || -z "${basic_units:-}" || -z "${standard_units:-}" || -z "${pro_units:-}" ]]; then
-    echo "ERROR: $case_name must contain exactly three comma-separated unit values: '$values'" >&2
+    echo "ERROR: USER_RATE_LIMITS must contain exactly three comma-separated unit values: '$values'" >&2
     exit 1
   fi
   for units in "$basic_units" "$standard_units" "$pro_units"; do
     if [[ ! "$units" =~ ^[0-9]+$ ]]; then
-      echo "ERROR: $case_name contains an invalid unit value: '$units'" >&2
+      echo "ERROR: USER_RATE_LIMITS contains an invalid unit value: '$units'" >&2
       exit 1
     fi
   done
-  printf '%s:%s:%s' "$basic_units" "$standard_units" "$pro_units"
 }
 
-cases=(
-  "under-provisioning:$(parse_case UNDER_PROVISIONING_TEST "${UNDER_PROVISIONING_TEST:-10,20,30}")"
-  "over-provisioning:$(parse_case OVER_PROVISIONING_TEST "${OVER_PROVISIONING_TEST:-10000,10000,10000}")"
-  "fine-tuned-provisioning:$(parse_case FINE_TUNED_TEST "${FINE_TUNED_TEST:-25,40,50}")"
-)
+user_rate_limits="${USER_RATE_LIMITS:-10,20,40}"
+validate_rate_limits "$user_rate_limits"
 
-for case in "${cases[@]}"; do
-  IFS=":" read -r caseName basicUnits standardUnits proUnits <<< "$case"
-  runId="${caseName}-$(date +%Y%m%d%H%M%S)"
-  echo "Starting $caseName: basic=$basicUnits, standard=$standardUnits, pro=$proUnits units/min"
+runId="llm-workload-$(date +%Y%m%d%H%M%S)"
+echo "Starting run $runId (USER_RATE_LIMITS=$user_rate_limits units/min, basic/standard/pro)"
 
-  if [[ -f target/gatling-llm-simulations-0.1.0-SNAPSHOT.jar && "${USE_JAR:-false}" == "true" ]]; then
-    # shellcheck disable=SC2086
-    java $JAVA_OPTS \
-      -Dgatling.core.checkVersion=false \
-      -Dgatling.runId="$runId" \
-      -DBASIC_UNITS_PER_MINUTE="$basicUnits" \
-      -DSTANDARD_UNITS_PER_MINUTE="$standardUnits" \
-      -DPRO_UNITS_PER_MINUTE="$proUnits" \
-      -jar target/gatling-llm-simulations-0.1.0-SNAPSHOT.jar \
-      -s simulations.LLMWorkloadSimulation -rf target/gatling
-  else
-    sh ./mvnw -o \
-      -Dmaven.repo.local="$ROOT_DIR/local-repo" \
-      -Dgatling.runId="$runId" \
-      -DBASIC_UNITS_PER_MINUTE="$basicUnits" \
-      -DSTANDARD_UNITS_PER_MINUTE="$standardUnits" \
-      -DPRO_UNITS_PER_MINUTE="$proUnits" \
-      gatling:test \
-      -Dgatling.simulationClass=simulations.LLMWorkloadSimulation
-  fi
-done
-
-# Record the oversubscription rate: the per-tier ratio of the fine-tuned unit
-# budgets to the under-provisioned ones (fine_tuned / under_provisioning), in
-# [basic, standard, pro] order, stored as exact decimals. One JSON object per
-# experiment is appended to results/oversubscription-rate.jsonl.
-summary_timestamp="$(date +%Y%m%d%H%M%S)"
-under_for_rate="$(parse_case UNDER_PROVISIONING_TEST "${UNDER_PROVISIONING_TEST:-10,20,30}")"
-fine_for_rate="$(parse_case FINE_TUNED_TEST "${FINE_TUNED_TEST:-25,40,50}")"
-IFS=":" read -r underBasic underStandard underPro <<< "$under_for_rate"
-IFS=":" read -r fineBasic fineStandard finePro <<< "$fine_for_rate"
-oversubscription="$(awk -v ub="$underBasic" -v us="$underStandard" -v up="$underPro" \
-  -v fb="$fineBasic" -v fs="$fineStandard" -v fp="$finePro" 'BEGIN {
-    CONVFMT = "%.17g"
-    OFMT = "%.17g"
-    r1 = (ub == 0) ? "null" : fb / ub
-    r2 = (us == 0) ? "null" : fs / us
-    r3 = (up == 0) ? "null" : fp / up
-    printf "[%s, %s, %s]", r1, r2, r3
-  }')"
-mkdir -p "$ROOT_DIR/results"
-printf '{"run_timestamp":"%s","under_provisioning":[%s,%s,%s],"fine_tuned":[%s,%s,%s],"oversubscription_rate":%s}\n' \
-  "$summary_timestamp" "$underBasic" "$underStandard" "$underPro" \
-  "$fineBasic" "$fineStandard" "$finePro" "$oversubscription" \
-  >> "$ROOT_DIR/results/oversubscription-rate.jsonl"
-echo "Oversubscription rate (fine-tuned / under-provisioned, basic/standard/pro): $oversubscription"
-echo "Oversubscription rate stored in $ROOT_DIR/results/oversubscription-rate.jsonl"
+if [[ -f target/gatling-llm-simulations-0.1.0-SNAPSHOT.jar && "${USE_JAR:-false}" == "true" ]]; then
+  # shellcheck disable=SC2086
+  java $JAVA_OPTS \
+    -Dgatling.core.checkVersion=false \
+    -Dgatling.runId="$runId" \
+    -DUSER_RATE_LIMITS="$user_rate_limits" \
+    -jar target/gatling-llm-simulations-0.1.0-SNAPSHOT.jar \
+    -s simulations.LLMWorkloadSimulation -rf target/gatling
+else
+  sh ./mvnw -o \
+    -Dmaven.repo.local="$ROOT_DIR/local-repo" \
+    -Dgatling.runId="$runId" \
+    -DUSER_RATE_LIMITS="$user_rate_limits" \
+    gatling:test \
+    -Dgatling.simulationClass=simulations.LLMWorkloadSimulation
+fi
